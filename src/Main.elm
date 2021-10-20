@@ -39,18 +39,40 @@ type alias Model =
 
 
 config =
-    { burnTime = 1
-    , deadTime = 3
+    let
+        deltaT =
+            50
+
+        multiplier =
+            250.0 / deltaT
+    in
+    { deltaT = deltaT
+    , burnTime = Basics.round (multiplier * 1)
+    , deadTime = Basics.round (multiplier * 3)
     , neighborLocations =
         [ ( -1, 0 ), ( 1, 0 ), ( 0, -1 ), ( 0, 1 ) ]
     , pGrow = 0.05
+    , growDropOff = 1.3 -- 1.3 is good for 4 neighbor locations, 1 is good for 8
+    , pCatchFire = 0.005
+    , pSpreadFire = 0.15
+    , spreadFireRampUp = 1
     }
+
+
+dropOff dropOff_ n =
+    1.0 / (1.0 + e ^ (dropOff_ * n - 4))
+
+
+{-| complementary events
+-}
+rampUp pOrig n =
+    1.0 - ((1.0 - pOrig) ^ n)
 
 
 newModel : Model
 newModel =
     { forest =
-        [ [ Nothing, Just Living, Nothing, Nothing ]
+        [ [ Nothing, Just Living, Just (Burning 0), Nothing ]
         , [ Just (Burning 0), Nothing, Just Living, Nothing ]
         , [ Nothing, Just (Dead 0), Nothing, Just Living ]
         , [ Just Living, Nothing, Just (Burning 0), Nothing ]
@@ -76,7 +98,8 @@ main =
 
 type Msg
     = Tick
-    | Grow ( Int, Int ) Float -- Row, Column
+    | Grow ( Int, Int ) Float Float -- Row, Column
+    | CatchFire ( Int, Int ) Float Float
 
 
 rand =
@@ -162,31 +185,60 @@ neighborSituation forest row column =
         |> List.foldl addNeighbor NoNeighbors
 
 
+countBurningTrees : List Tree -> Int
+countBurningTrees trees =
+    let
+        counter tree count =
+            case tree of
+                Burning _ ->
+                    count + 1
+
+                _ ->
+                    count
+    in
+    List.foldl counter 0 trees
+
+
 cellTick : Forest -> Int -> Int -> Maybe Tree -> ( Maybe Tree, Cmd Msg )
 cellTick forest row column mTree =
     case mTree of
         Just tree ->
             case tree of
+                -- TODO: Randomly die of natural causes in all of these cases
                 Living ->
                     case neighborSituation forest row column of
                         NoNeighbors ->
-                            -- TODO: Randomly catch fire from new fire event
-                            ( Just tree, Cmd.none )
+                            ( Just tree, probabilistically (CatchFire ( row, column ) config.pCatchFire) )
 
                         Neighbors neighborhood ->
                             case neighborhood of
                                 Mix neighborTrees ->
                                     -- TODO if any trees are burning then randomly catch fire from new event with compounding probability from multiple burning neighbors
-                                    ( Just tree, Cmd.none )
+                                    let
+                                        burnCount =
+                                            countBurningTrees neighborTrees
+
+                                        pSpreadFire =
+                                            rampUp config.pSpreadFire (toFloat burnCount)
+                                    in
+                                    if burnCount > 0 then
+                                        ( Just tree, probabilistically (CatchFire ( row, column ) pSpreadFire) )
+
+                                    else
+                                        ( Just tree, Cmd.none )
 
                                 Only n neighborTree neighborTrees ->
                                     case neighborTree of
                                         Living ->
-                                            ( Just tree, Cmd.none )
+                                            -- TODO: Perhaps a dense forest decreases the chances of catching fire slightly
+                                            ( Just tree, probabilistically (CatchFire ( row, column ) config.pCatchFire) )
 
                                         Burning _ ->
-                                            -- TODO randomly catch fire from new event or with compounding probability from burning neighbors
-                                            ( Just tree, Cmd.none )
+                                            let
+                                                pSpreadFire =
+                                                    rampUp config.pSpreadFire (toFloat n)
+                                            in
+                                            ( Just tree, probabilistically (CatchFire ( row, column ) pSpreadFire) )
 
                                         Dead _ ->
                                             ( Just tree, Cmd.none )
@@ -199,6 +251,8 @@ cellTick forest row column mTree =
                         ( Just (Burning (burnTime + 1)), Cmd.none )
 
                 Dead deadTime ->
+                    -- TODO: Randomly catch fire with higher probability in each of these cases
+                    -- TODO: Randomly catch fire from burning neighbor with very high probability
                     if deadTime > config.deadTime then
                         -- STRETCH falling dead tree causes live tree to die
                         ( Nothing, Cmd.none )
@@ -209,7 +263,7 @@ cellTick forest row column mTree =
         Nothing ->
             case neighborSituation forest row column of
                 NoNeighbors ->
-                    ( Nothing, probabilistically (Grow ( row, column )) )
+                    ( Nothing, probabilistically (Grow ( row, column ) config.pGrow) )
 
                 Neighbors neighborhood ->
                     case neighborhood of
@@ -219,8 +273,11 @@ cellTick forest row column mTree =
                         Only n tree neighborTrees ->
                             case tree of
                                 Living ->
-                                    -- TODO: Randomly grow a tree next to living trees
-                                    ( Nothing, Cmd.none )
+                                    let
+                                        pGrow =
+                                            config.pGrow * dropOff config.growDropOff (toFloat n)
+                                    in
+                                    ( Nothing, probabilistically (Grow ( row, column ) pGrow) )
 
                                 Dead _ ->
                                     -- TODO: Randomly grow a tree next to dead trees
@@ -283,9 +340,16 @@ update msg model =
             in
             ( { model | forest = forest }, cmd )
 
-        Grow position rng ->
-            if rng < config.pGrow then
+        Grow position pGrow rng ->
+            if rng < pGrow then
                 ( { model | forest = forestSet position (Just Living) model.forest }, Cmd.none )
+
+            else
+                ( model, Cmd.none )
+
+        CatchFire position pCatchFire rng ->
+            if rng < pCatchFire then
+                ( { model | forest = forestSet position (Just (Burning 0)) model.forest }, Cmd.none )
 
             else
                 ( model, Cmd.none )
@@ -374,4 +438,4 @@ view model =
 
 subscriptions : Model -> Sub Msg
 subscriptions =
-    always <| Time.every 250 (always Tick)
+    always <| Time.every config.deltaT (always Tick)
